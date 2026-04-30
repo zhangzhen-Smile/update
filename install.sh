@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # OpenClaw one-click installer with Gateway recovery
 # Target: Ubuntu 22.04 / 24.04
+#
+# Env:
+#   OPENCLAW_SKIP_LOGIN_SHELL=1   — never exec bash -l after success
+#   OPENCLAW_FORCE_LOGIN_SHELL=1 — always exec bash -l even when stdin is not a TTY (e.g. curl|bash)
+#   HEARTBEAT_SECONDS            — heartbeat interval (default 15)
 
 # Re-exec with bash when started by sh/dash
 if [ -z "${BASH_VERSION:-}" ]; then
@@ -11,10 +16,12 @@ set -Eeuo pipefail
 
 BASE_URL="https://orcaterm-script-1258344699.cos.ap-shanghai.myqcloud.com/linux/AI/openclaw"
 HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-15}"
+OPENCLAW_SKIP_LOGIN_SHELL="${OPENCLAW_SKIP_LOGIN_SHELL:-0}"
 
 HEARTBEAT_PID=""
 CURRENT_TMP_SCRIPT=""
 CURRENT_TMP_LOG=""
+STEP02_ORIG_FAIL_LOG=""
 NPM_USERCONFIG_TMP=""
 OPENCLAW_BIN=""
 
@@ -64,8 +71,10 @@ stop_heartbeat() {
 cleanup_tmp() {
   [ -n "${CURRENT_TMP_SCRIPT}" ] && rm -f "${CURRENT_TMP_SCRIPT}" 2>/dev/null || true
   [ -n "${CURRENT_TMP_LOG}" ] && rm -f "${CURRENT_TMP_LOG}" 2>/dev/null || true
+  [ -n "${STEP02_ORIG_FAIL_LOG:-}" ] && rm -f "${STEP02_ORIG_FAIL_LOG}" 2>/dev/null || true
   CURRENT_TMP_SCRIPT=""
   CURRENT_TMP_LOG=""
+  STEP02_ORIG_FAIL_LOG=""
 }
 
 cleanup_registry_override() {
@@ -267,18 +276,22 @@ bootstrap_openclaw_cli() {
     *) export PATH="${npm_prefix}/bin:${PATH}" ;;
   esac
 
+  local bootstrap_log
+  bootstrap_log="$(mktemp /tmp/openclaw-cli-bootstrap-XXXXXX.log)"
+
   for registry in "${REGISTRY_CANDIDATES[@]}"; do
     apply_registry_override "${registry}"
     log_warn "openclaw CLI missing; trying npm install with registry: $(normalize_registry "${registry}")"
-    if npm install -g openclaw@latest >/tmp/openclaw-cli-bootstrap.log 2>&1; then
+    if npm install -g openclaw@latest >"${bootstrap_log}" 2>&1; then
       if ensure_openclaw_command; then
         log_info "openclaw CLI bootstrap succeeded: ${OPENCLAW_BIN}"
+        rm -f "${bootstrap_log}" 2>/dev/null || true
         return 0
       fi
     fi
   done
 
-  log_error "Failed to bootstrap openclaw CLI. Log: /tmp/openclaw-cli-bootstrap.log"
+  log_error "Failed to bootstrap openclaw CLI. Log: ${bootstrap_log}"
   return 1
 }
 
@@ -287,16 +300,24 @@ retry_openclaw_install_with_registries() {
   local registry
   local idx=0
   local total=${#REGISTRY_CANDIDATES[@]}
+  local prev_log=""
 
   for registry in "${REGISTRY_CANDIDATES[@]}"; do
     idx=$((idx + 1))
     apply_registry_override "${registry}"
     patch_hardcoded_registry_in_script "${script_path}" "${registry}"
+    if [ -n "${prev_log}" ]; then
+      rm -f "${prev_log}" 2>/dev/null || true
+    fi
     CURRENT_TMP_LOG="$(mktemp /tmp/openclaw-install-XXXXXX.log)"
+    prev_log="${CURRENT_TMP_LOG}"
     log_warn "Retrying 02-install-openclaw.sh with registry (${idx}/${total})..."
 
     if run_step_script "${script_path}" "${CURRENT_TMP_LOG}"; then
       log_info "Retry succeeded with registry: $(normalize_registry "${registry}")"
+      rm -f "${CURRENT_TMP_LOG}" 2>/dev/null || true
+      CURRENT_TMP_LOG=""
+      prev_log=""
       return 0
     fi
 
@@ -314,9 +335,40 @@ retry_openclaw_install_with_registries() {
 
 is_gateway_service_known_issue() {
   local log_file="$1"
+  [ -n "${log_file}" ] && [ -f "${log_file}" ] || return 1
   grep -Eqi \
-    'openclaw-gateway\.service does not exist|systemctl( --user)? is-enabled unavailable|Failed to connect to bus' \
+    'openclaw-gateway(\.service)? does not exist|Gateway install failed|systemctl enable failed|Failed to enable unit|Unit file openclaw-gateway|systemctl( --user)? is-enabled unavailable|Failed to connect to bus' \
     "$log_file"
+}
+
+# After step 02, the first failure log and the last retry log may differ; check both.
+step02_gateway_recovery_candidate() {
+  local f
+  for f in "$@"; do
+    [ -z "${f}" ] && continue
+    is_gateway_service_known_issue "${f}" && return 0
+  done
+  return 1
+}
+
+try_gateway_recovery_step02() {
+  local script_name="$1"
+  local description="$2"
+
+  if [ "${script_name}" != "02-install-openclaw.sh" ]; then
+    return 1
+  fi
+  if ! step02_gateway_recovery_candidate "${STEP02_ORIG_FAIL_LOG}" "${CURRENT_TMP_LOG}"; then
+    return 1
+  fi
+  if ! recover_gateway_install_failure; then
+    return 1
+  fi
+  log_warn "Gateway issue recovered; continue installation."
+  cleanup_tmp
+  log_info "Done (recovered): ${description}"
+  echo ""
+  return 0
 }
 
 prepare_user_systemd_context() {
@@ -437,14 +489,17 @@ fallback_start_gateway_process() {
 
   gateway_log="/tmp/openclaw-gateway.log"
   nohup "${OPENCLAW_BIN}" gateway --port 18789 --bind loopback >"${gateway_log}" 2>&1 &
-  sleep 2
 
-  if openclaw_exec gateway status --require-rpc >/dev/null 2>&1; then
-    log_warn "Gateway started as background process (not systemd). Log: ${gateway_log}"
-    return 0
-  fi
+  local attempt
+  for attempt in $(seq 1 20); do
+    sleep 2
+    if openclaw_exec gateway status --require-rpc >/dev/null 2>&1; then
+      log_warn "Gateway started as background process (not systemd). Log: ${gateway_log}"
+      return 0
+    fi
+  done
 
-  log_warn "Failed to start gateway background process. Check: ${gateway_log}"
+  log_warn "Failed to start gateway background process after ~40s. Check: ${gateway_log}"
   return 1
 }
 
@@ -461,12 +516,20 @@ recover_gateway_install_failure() {
     fi
   fi
 
-  if openclaw_exec gateway install --force >/tmp/openclaw-gateway-fix.log 2>&1; then
+  local gw_fix_log
+  gw_fix_log="$(mktemp /tmp/openclaw-gateway-fix-XXXXXX.log)"
+
+  if openclaw_exec gateway install --force >>"${gw_fix_log}" 2>&1; then
     log_info "Gateway recovery via 'openclaw gateway install --force' succeeded."
+    rm -f "${gw_fix_log}" 2>/dev/null || true
     return 0
   fi
 
-  log_warn "Official gateway install recovery failed; trying manual user service."
+  log_warn "Official gateway install recovery failed; tail of log:"
+  tail -25 "${gw_fix_log}" 2>/dev/null | while IFS= read -r line || [ -n "${line}" ]; do log_warn "  ${line}"; done || true
+  rm -f "${gw_fix_log}" 2>/dev/null || true
+
+  log_warn "Trying manual systemd unit..."
 
   if manual_install_gateway_service; then
     return 0
@@ -493,8 +556,10 @@ run_remote_script() {
 
   CURRENT_TMP_SCRIPT="$(mktemp /tmp/openclaw-install-XXXXXX.sh)"
   CURRENT_TMP_LOG="$(mktemp /tmp/openclaw-install-XXXXXX.log)"
+  STEP02_ORIG_FAIL_LOG=""
 
-  if ! curl -fSL --connect-timeout 10 --max-time 180 -o "${CURRENT_TMP_SCRIPT}" "${url}"; then
+  if ! curl -fSL --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 2 \
+    -o "${CURRENT_TMP_SCRIPT}" "${url}"; then
     log_error "Download failed: ${script_name}"
     cleanup_tmp
     return 1
@@ -515,7 +580,16 @@ run_remote_script() {
   fi
 
   if [ "${run_code}" -ne 0 ]; then
-    if [ "${script_name}" = "02-install-openclaw.sh" ] && is_pnpm_fetch_issue "${CURRENT_TMP_LOG}"; then
+    if [ "${script_name}" = "02-install-openclaw.sh" ]; then
+      STEP02_ORIG_FAIL_LOG="${CURRENT_TMP_LOG}"
+    fi
+
+    # Prefer gateway recovery when logs show systemd/gateway errors (before spending time on registry mirrors).
+    if try_gateway_recovery_step02 "${script_name}" "${description}"; then
+      return 0
+    fi
+
+    if [ "${script_name}" = "02-install-openclaw.sh" ] && is_pnpm_fetch_issue "${STEP02_ORIG_FAIL_LOG}"; then
       log_warn "Detected pnpm fetch/network failure in 02 step."
       if retry_openclaw_install_with_registries "${CURRENT_TMP_SCRIPT}"; then
         cleanup_tmp
@@ -525,14 +599,9 @@ run_remote_script() {
       fi
     fi
 
-    if [ "${script_name}" = "02-install-openclaw.sh" ] && is_gateway_service_known_issue "${CURRENT_TMP_LOG}"; then
-      if recover_gateway_install_failure; then
-        log_warn "Gateway issue recovered; continue installation."
-        cleanup_tmp
-        log_info "Done (recovered): ${description}"
-        echo ""
-        return 0
-      fi
+    # After mirror retries, logs may only contain gateway errors on the last attempt.
+    if try_gateway_recovery_step02 "${script_name}" "${description}"; then
+      return 0
     fi
 
     log_error "Execution failed: ${script_name}"
@@ -568,11 +637,41 @@ verify_install() {
   return 0
 }
 
+warn_if_unsupported_os() {
+  if [ ! -f /etc/os-release ]; then
+    return 0
+  fi
+  # shellcheck source=/dev/null
+  . /etc/os-release
+  if [[ "${ID:-}" != "ubuntu" ]]; then
+    log_warn "Detected OS: ${PRETTY_NAME:-unknown}; script targets Ubuntu 22.04/24.04."
+    return 0
+  fi
+  local major="${VERSION_ID%%.*}"
+  if [[ "${major}" =~ ^[0-9]+$ ]] && [ "${major}" -lt 22 ]; then
+    log_warn "Ubuntu ${VERSION_ID:-?} may be unsupported; prefer 22.04 or 24.04 LTS."
+  fi
+}
+
+require_basic_tools() {
+  if ! command -v curl >/dev/null 2>&1; then
+    log_error "curl is required. On Ubuntu: sudo apt-get update && sudo apt-get install -y curl"
+    exit 1
+  fi
+  if ! command -v mktemp >/dev/null 2>&1; then
+    log_error "mktemp missing (unexpected on Ubuntu)."
+    exit 1
+  fi
+}
+
 main() {
   log_info "========== OpenClaw one-click installer =========="
   log_info "Start time: $(date)"
   log_info "Heartbeat every ${HEARTBEAT_SECONDS}s"
   echo ""
+
+  require_basic_tools
+  warn_if_unsupported_os
 
   start_heartbeat
   export OPENCLAW_HEARTBEAT_ACTIVE=1
@@ -597,10 +696,25 @@ main() {
       log_info "Recommended check: openclaw gateway status --deep"
     else
       log_error "Install finished but verification found issues."
+      cleanup_registry_override
+      stop_heartbeat
       exit 1
     fi
 
     stop_heartbeat
+    cleanup_registry_override
+
+    if [ "${OPENCLAW_SKIP_LOGIN_SHELL}" = "1" ]; then
+      log_info "OPENCLAW_SKIP_LOGIN_SHELL=1 — exiting without spawning login shell."
+      exit 0
+    fi
+
+    if [ "${OPENCLAW_FORCE_LOGIN_SHELL:-0}" != "1" ] && [ ! -t 0 ]; then
+      log_info "stdin is not a TTY — skipping «exec bash -l» so the installer does not exit immediately."
+      log_info "(curl|bash / CI: use OPENCLAW_SKIP_LOGIN_SHELL=1 explicitly, or OPENCLAW_FORCE_LOGIN_SHELL=1 to force login shell.)"
+      exit 0
+    fi
+
     exec bash -l
   else
     log_error "========== Installation failed =========="
