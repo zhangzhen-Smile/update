@@ -2,10 +2,11 @@
 # OpenClaw one-click installer with Gateway recovery
 # Target: Ubuntu 22.04 / 24.04
 #
-# Env:
-#   OPENCLAW_SKIP_LOGIN_SHELL=1   — never exec bash -l after success
-#   OPENCLAW_FORCE_LOGIN_SHELL=1 — always exec bash -l even when stdin is not a TTY (e.g. curl|bash)
-#   HEARTBEAT_SECONDS            — heartbeat interval (default 15)
+# Prefer: sudo -H bash install.sh   (so HOME=/root when installing as root)
+# Env: OPENCLAW_SKIP_LOGIN_SHELL=1 — skip «exec bash -l» after success
+#      OPENCLAW_FORCE_LOGIN_SHELL=1 — force login shell even when stdin is not a TTY
+#      OPENCLAW_GATEWAY_INSTALL_TIMEOUT_SEC — recovery «gateway install --force» timeout (default 240)
+#      OPENCLAW_NO_GATEWAY_INSTALL_TIMEOUT=1 — do not use timeout(1) on recovery install
 
 # Re-exec with bash when started by sh/dash
 if [ -z "${BASH_VERSION:-}" ]; then
@@ -144,6 +145,24 @@ bootstrap_node_env() {
     *) [ -d "${HOME}/.openclaw/bin" ] && export PATH="${HOME}/.openclaw/bin:${PATH}" ;;
   esac
 
+  # pnpm global bin directory (COS installer often uses pnpm).
+  if command -v pnpm >/dev/null 2>&1; then
+    local pnpm_global_bin
+    pnpm_global_bin="$(pnpm bin -g 2>/dev/null || true)"
+    if [ -n "${pnpm_global_bin}" ] && [ -d "${pnpm_global_bin}" ]; then
+      case ":$PATH:" in *":${pnpm_global_bin}:"*) ;; *) export PATH="${pnpm_global_bin}:${PATH}" ;; esac
+    fi
+  fi
+
+  # Effective root but HOME still /home/foo (sudo without -H): binaries often under /root.
+  if [ "$(id -u)" -eq 0 ]; then
+    local rb
+    for rb in /root/.local/bin /root/.npm-global/bin /root/.openclaw/bin; do
+      [ -d "${rb}" ] || continue
+      case ":$PATH:" in *":${rb}:"*) ;; *) export PATH="${rb}:${PATH}" ;; esac
+    done
+  fi
+
   hash -r 2>/dev/null || true
 }
 
@@ -164,6 +183,9 @@ ensure_openclaw_command() {
     "${HOME}/.npm-global/bin/openclaw" \
     "${HOME}/.local/bin/openclaw" \
     "${HOME}/.openclaw/bin/openclaw" \
+    "/root/.local/bin/openclaw" \
+    "/root/.npm-global/bin/openclaw" \
+    "/root/.openclaw/bin/openclaw" \
     "/usr/local/bin/openclaw" \
     "/usr/bin/openclaw"
   do
@@ -341,7 +363,6 @@ is_gateway_service_known_issue() {
     "$log_file"
 }
 
-# After step 02, the first failure log and the last retry log may differ; check both.
 step02_gateway_recovery_candidate() {
   local f
   for f in "$@"; do
@@ -505,42 +526,65 @@ fallback_start_gateway_process() {
 
 recover_gateway_install_failure() {
   log_warn "Detected known Gateway service install issue. Starting recovery..."
+  log_info "Recovery steps: (1) openclaw gateway install --force (2) systemd unit (3) nohup."
+
+  bootstrap_node_env
 
   if ! ensure_openclaw_command; then
     debug_openclaw_env
-    log_warn "openclaw command missing in current shell; trying CLI bootstrap..."
+    log_warn "openclaw not in PATH after bootstrap; trying CLI bootstrap..."
     if ! bootstrap_openclaw_cli; then
       debug_openclaw_env
-      log_error "openclaw command missing; cannot recover."
+      log_error "Still cannot find «openclaw». If you used sudo, try: sudo -H bash $0"
+      log_error "Or run: hash -r && command -v openclaw"
       return 1
     fi
   fi
 
+  log_info "Recovery: using OPENCLAW_BIN=${OPENCLAW_BIN}"
+
   local gw_fix_log
   gw_fix_log="$(mktemp /tmp/openclaw-gateway-fix-XXXXXX.log)"
+  log_info "Recovery 1/3: «openclaw gateway install --force» (log: ${gw_fix_log}; may take up to a few minutes)..."
 
-  if openclaw_exec gateway install --force >>"${gw_fix_log}" 2>&1; then
-    log_info "Gateway recovery via 'openclaw gateway install --force' succeeded."
+  local gw_force_ok=1
+  local tsec="${OPENCLAW_GATEWAY_INSTALL_TIMEOUT_SEC:-240}"
+
+  set +e
+  if command -v timeout >/dev/null 2>&1 && [ "${OPENCLAW_NO_GATEWAY_INSTALL_TIMEOUT:-0}" != "1" ]; then
+    timeout "${tsec}" "${OPENCLAW_BIN}" gateway install --force >>"${gw_fix_log}" 2>&1
+    gw_force_ok=$?
+    if [ "${gw_force_ok}" -eq 124 ]; then
+      log_warn "«gateway install --force» exceeded ${tsec}s; trying manual systemd unit."
+      gw_force_ok=1
+    fi
+  else
+    "${OPENCLAW_BIN}" gateway install --force >>"${gw_fix_log}" 2>&1
+    gw_force_ok=$?
+  fi
+  set -e
+
+  if [ "${gw_force_ok}" -eq 0 ]; then
+    log_info "Gateway recovery via «gateway install --force» succeeded."
     rm -f "${gw_fix_log}" 2>/dev/null || true
     return 0
   fi
 
-  log_warn "Official gateway install recovery failed; tail of log:"
+  log_warn "«gateway install --force» failed. Last lines from ${gw_fix_log}:"
   tail -25 "${gw_fix_log}" 2>/dev/null | while IFS= read -r line || [ -n "${line}" ]; do log_warn "  ${line}"; done || true
   rm -f "${gw_fix_log}" 2>/dev/null || true
 
-  log_warn "Trying manual systemd unit..."
-
+  log_info "Recovery 2/3: writing systemd unit under /etc/systemd/system (root) or user systemd..."
   if manual_install_gateway_service; then
     return 0
   fi
 
-  log_warn "Manual systemd recovery failed; trying background fallback."
+  log_info "Recovery 3/3: starting gateway with nohup..."
   if fallback_start_gateway_process; then
     return 0
   fi
 
-  log_error "Gateway automatic recovery failed. Run: openclaw doctor && openclaw gateway status --deep"
+  log_error "Gateway automatic recovery failed. Run as root if needed: sudo openclaw doctor && sudo openclaw gateway status --deep"
   return 1
 }
 
@@ -584,7 +628,6 @@ run_remote_script() {
       STEP02_ORIG_FAIL_LOG="${CURRENT_TMP_LOG}"
     fi
 
-    # Prefer gateway recovery when logs show systemd/gateway errors (before spending time on registry mirrors).
     if try_gateway_recovery_step02 "${script_name}" "${description}"; then
       return 0
     fi
@@ -599,7 +642,6 @@ run_remote_script() {
       fi
     fi
 
-    # After mirror retries, logs may only contain gateway errors on the last attempt.
     if try_gateway_recovery_step02 "${script_name}" "${description}"; then
       return 0
     fi
@@ -637,41 +679,16 @@ verify_install() {
   return 0
 }
 
-warn_if_unsupported_os() {
-  if [ ! -f /etc/os-release ]; then
-    return 0
-  fi
-  # shellcheck source=/dev/null
-  . /etc/os-release
-  if [[ "${ID:-}" != "ubuntu" ]]; then
-    log_warn "Detected OS: ${PRETTY_NAME:-unknown}; script targets Ubuntu 22.04/24.04."
-    return 0
-  fi
-  local major="${VERSION_ID%%.*}"
-  if [[ "${major}" =~ ^[0-9]+$ ]] && [ "${major}" -lt 22 ]; then
-    log_warn "Ubuntu ${VERSION_ID:-?} may be unsupported; prefer 22.04 or 24.04 LTS."
-  fi
-}
-
-require_basic_tools() {
-  if ! command -v curl >/dev/null 2>&1; then
-    log_error "curl is required. On Ubuntu: sudo apt-get update && sudo apt-get install -y curl"
-    exit 1
-  fi
-  if ! command -v mktemp >/dev/null 2>&1; then
-    log_error "mktemp missing (unexpected on Ubuntu)."
-    exit 1
-  fi
-}
-
 main() {
   log_info "========== OpenClaw one-click installer =========="
   log_info "Start time: $(date)"
   log_info "Heartbeat every ${HEARTBEAT_SECONDS}s"
   echo ""
 
-  require_basic_tools
-  warn_if_unsupported_os
+  if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "${HOME}" != "/root" ]; then
+    log_warn "You are root via sudo but HOME=${HOME} (not /root). Prefer: sudo -H bash $0"
+    log_warn "Otherwise recovery may not find the «openclaw» binary installed under /root."
+  fi
 
   start_heartbeat
   export OPENCLAW_HEARTBEAT_ACTIVE=1
@@ -705,13 +722,12 @@ main() {
     cleanup_registry_override
 
     if [ "${OPENCLAW_SKIP_LOGIN_SHELL}" = "1" ]; then
-      log_info "OPENCLAW_SKIP_LOGIN_SHELL=1 — exiting without spawning login shell."
+      log_info "OPENCLAW_SKIP_LOGIN_SHELL=1 — exiting without login shell."
       exit 0
     fi
 
     if [ "${OPENCLAW_FORCE_LOGIN_SHELL:-0}" != "1" ] && [ ! -t 0 ]; then
-      log_info "stdin is not a TTY — skipping «exec bash -l» so the installer does not exit immediately."
-      log_info "(curl|bash / CI: use OPENCLAW_SKIP_LOGIN_SHELL=1 explicitly, or OPENCLAW_FORCE_LOGIN_SHELL=1 to force login shell.)"
+      log_info "stdin is not a terminal — skipping «exec bash -l» (use OPENCLAW_FORCE_LOGIN_SHELL=1 to force)."
       exit 0
     fi
 
