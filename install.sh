@@ -105,17 +105,31 @@ normalize_registry() {
 }
 
 bootstrap_node_env() {
-  # Try common profile files first.
+  # When root via «sudo bash» without -H, HOME may still be /home/foo. Sourcing that user's
+  # .bashrc can run «exit» and kill this installer — only load /root profile snippets instead.
+  local profile_home="${HOME}"
+  if [ "$(id -u)" -eq 0 ] && [ "${HOME}" != "/root" ]; then
+    profile_home="/root"
+  fi
+
   [ -f /etc/profile ] && source /etc/profile >/dev/null 2>&1 || true
   [ -f /etc/bash.bashrc ] && source /etc/bash.bashrc >/dev/null 2>&1 || true
-  [ -f "${HOME}/.profile" ] && source "${HOME}/.profile" >/dev/null 2>&1 || true
-  [ -f "${HOME}/.bashrc" ] && source "${HOME}/.bashrc" >/dev/null 2>&1 || true
+
+  if [ "$(id -u)" -eq 0 ] && [ "${HOME}" != "/root" ]; then
+    [ -f "${profile_home}/.profile" ] && source "${profile_home}/.profile" >/dev/null 2>&1 || true
+    [ -f "${profile_home}/.bashrc" ] && source "${profile_home}/.bashrc" >/dev/null 2>&1 || true
+  else
+    [ -f "${HOME}/.profile" ] && source "${HOME}/.profile" >/dev/null 2>&1 || true
+    [ -f "${HOME}/.bashrc" ] && source "${HOME}/.bashrc" >/dev/null 2>&1 || true
+  fi
 
   # NVM initialization (common locations).
   if [ -s "${NVM_DIR:-/usr/local/nvm}/nvm.sh" ]; then
     source "${NVM_DIR:-/usr/local/nvm}/nvm.sh" >/dev/null 2>&1 || true
   fi
-  if [ -s "${HOME}/.nvm/nvm.sh" ]; then
+  if [ -s "${profile_home}/.nvm/nvm.sh" ]; then
+    source "${profile_home}/.nvm/nvm.sh" >/dev/null 2>&1 || true
+  elif [ -s "${HOME}/.nvm/nvm.sh" ]; then
     source "${HOME}/.nvm/nvm.sh" >/dev/null 2>&1 || true
   fi
 
@@ -131,19 +145,23 @@ bootstrap_node_env() {
     fi
   fi
 
-  # Common fallback paths.
-  case ":$PATH:" in
-    *":${HOME}/.npm-global/bin:"*) ;;
-    *) [ -d "${HOME}/.npm-global/bin" ] && export PATH="${HOME}/.npm-global/bin:${PATH}" ;;
-  esac
-  case ":$PATH:" in
-    *":${HOME}/.local/bin:"*) ;;
-    *) [ -d "${HOME}/.local/bin" ] && export PATH="${HOME}/.local/bin:${PATH}" ;;
-  esac
-  case ":$PATH:" in
-    *":${HOME}/.openclaw/bin:"*) ;;
-    *) [ -d "${HOME}/.openclaw/bin" ] && export PATH="${HOME}/.openclaw/bin:${PATH}" ;;
-  esac
+  # Common fallback paths (prefer profile_home when root+skewed HOME, then HOME).
+  local __ph
+  for __ph in "${profile_home}" "${HOME}"; do
+    [ -z "${__ph}" ] && continue
+    case ":$PATH:" in *":${__ph}/.npm-global/bin:"*) ;; *)
+      [ -d "${__ph}/.npm-global/bin" ] && export PATH="${__ph}/.npm-global/bin:${PATH}"
+      ;;
+    esac
+    case ":$PATH:" in *":${__ph}/.local/bin:"*) ;; *)
+      [ -d "${__ph}/.local/bin" ] && export PATH="${__ph}/.local/bin:${PATH}"
+      ;;
+    esac
+    case ":$PATH:" in *":${__ph}/.openclaw/bin:"*) ;; *)
+      [ -d "${__ph}/.openclaw/bin" ] && export PATH="${__ph}/.openclaw/bin:${PATH}"
+      ;;
+    esac
+  done
 
   # pnpm global bin directory (COS installer often uses pnpm).
   if command -v pnpm >/dev/null 2>&1; then
@@ -154,7 +172,7 @@ bootstrap_node_env() {
     fi
   fi
 
-  # Effective root but HOME still /home/foo (sudo without -H): binaries often under /root.
+  # Effective root but HOME still /home/foo (sudo without -H): extra roots paths.
   if [ "$(id -u)" -eq 0 ]; then
     local rb
     for rb in /root/.local/bin /root/.npm-global/bin /root/.openclaw/bin; do
@@ -527,6 +545,7 @@ fallback_start_gateway_process() {
 recover_gateway_install_failure() {
   log_warn "Detected known Gateway service install issue. Starting recovery..."
   log_info "Recovery steps: (1) openclaw gateway install --force (2) systemd unit (3) nohup."
+  log_info "Recovery: refreshing PATH..."
 
   bootstrap_node_env
 
