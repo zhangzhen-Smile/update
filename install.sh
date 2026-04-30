@@ -1,33 +1,15 @@
-#!/bin/bash
-# OpenClaw 一键安装脚本
-# 依次从远程下载并执行四个安装步骤
+﻿#!/usr/bin/env bash
+# OpenClaw 一键安装（含 Gateway service 兼容修复）
+# 适用：Ubuntu 22.04 / 24.04
 
-set -e
+set -Eeuo pipefail
 
 BASE_URL="https://orcaterm-script-1258344699.cos.ap-shanghai.myqcloud.com/linux/AI/openclaw"
+HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-15}"
 
-# ========== 心跳保活 ==========
-# 防止终端因长时间无输出而判定脚本已结束
-# 每 15 秒输出一个进度点，确保终端持续收到输出
 HEARTBEAT_PID=""
-
-start_heartbeat() {
-  (
-    while true; do
-      sleep 15
-      echo "[$(date '+%H:%M:%S')] ... 安装进行中 ..."
-    done
-  ) &
-  HEARTBEAT_PID=$!
-}
-
-stop_heartbeat() {
-  if [ -n "$HEARTBEAT_PID" ]; then
-    kill $HEARTBEAT_PID 2>/dev/null || true
-    wait $HEARTBEAT_PID 2>/dev/null || true
-    HEARTBEAT_PID=""
-  fi
-}
+CURRENT_TMP_SCRIPT=""
+CURRENT_TMP_LOG=""
 
 STEPS=(
   "01-setup-deps.sh|系统依赖与环境配置"
@@ -40,27 +22,179 @@ log_info() {
   echo "[$(date '+%H:%M:%S')] $*"
 }
 
+log_warn() {
+  echo "[$(date '+%H:%M:%S')] WARN: $*"
+}
+
 log_error() {
   echo "[$(date '+%H:%M:%S')] ERROR: $*" >&2
 }
 
-# 用于追踪当前正在使用的临时脚本文件
-CURRENT_TMP_SCRIPT=""
+start_heartbeat() {
+  (
+    while true; do
+      sleep "$HEARTBEAT_SECONDS"
+      echo "[$(date '+%H:%M:%S')] ... 安装进行中 ..."
+    done
+  ) &
+  HEARTBEAT_PID=$!
+}
 
-# 中断处理：收到 SIGINT/SIGTERM 时清理所有子进程并退出（放在 log_error 之后确保可用）
+stop_heartbeat() {
+  if [ -n "${HEARTBEAT_PID}" ]; then
+    kill "${HEARTBEAT_PID}" 2>/dev/null || true
+    wait "${HEARTBEAT_PID}" 2>/dev/null || true
+    HEARTBEAT_PID=""
+  fi
+}
+
+cleanup_tmp() {
+  [ -n "${CURRENT_TMP_SCRIPT}" ] && rm -f "${CURRENT_TMP_SCRIPT}" 2>/dev/null || true
+  [ -n "${CURRENT_TMP_LOG}" ] && rm -f "${CURRENT_TMP_LOG}" 2>/dev/null || true
+  CURRENT_TMP_SCRIPT=""
+  CURRENT_TMP_LOG=""
+}
+
 cleanup_and_exit() {
-  # 重置 trap 避免重复触发
   trap - INT TERM EXIT
   echo ""
   log_error "收到中断信号，正在停止安装..."
-  # 清理可能残留的临时脚本文件
-  [ -n "$CURRENT_TMP_SCRIPT" ] && rm -f "$CURRENT_TMP_SCRIPT"
+  cleanup_tmp
   stop_heartbeat
   exit 130
 }
+
 trap cleanup_and_exit INT TERM
-# 确保脚本正常退出时也停止心跳
-trap stop_heartbeat EXIT
+trap 'cleanup_tmp; stop_heartbeat' EXIT
+
+is_gateway_service_known_issue() {
+  local log_file="$1"
+  grep -Eqi \
+    'openclaw-gateway\.service does not exist|systemctl( --user)? is-enabled unavailable|Failed to connect to bus' \
+    "$log_file"
+}
+
+prepare_user_systemd_context() {
+  local uid
+  uid="$(id -u)"
+
+  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${uid}}"
+  if [ ! -d "${XDG_RUNTIME_DIR}" ]; then
+    mkdir -p "${XDG_RUNTIME_DIR}" 2>/dev/null || true
+  fi
+  chmod 700 "${XDG_RUNTIME_DIR}" 2>/dev/null || true
+
+  if command -v loginctl >/dev/null 2>&1; then
+    loginctl enable-linger "${USER}" >/dev/null 2>&1 || true
+  fi
+}
+
+manual_install_gateway_service() {
+  local svc_dir svc_file openclaw_bin
+
+  if ! command -v openclaw >/dev/null 2>&1; then
+    log_warn "找不到 openclaw 命令，无法执行 Gateway 修复。"
+    return 1
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    log_warn "当前系统无 systemctl，跳过 systemd 修复。"
+    return 1
+  fi
+
+  prepare_user_systemd_context
+
+  # 尝试补齐 local 模式，避免 Gateway 因 mode 缺失拒绝启动。
+  openclaw config set gateway.mode local >/dev/null 2>&1 || true
+
+  svc_dir="${HOME}/.config/systemd/user"
+  svc_file="${svc_dir}/openclaw-gateway.service"
+  openclaw_bin="$(command -v openclaw)"
+
+  mkdir -p "${svc_dir}"
+
+  cat > "${svc_file}" <<EOF
+[Unit]
+Description=OpenClaw Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=${openclaw_bin} gateway --port 18789 --bind loopback
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+TimeoutStartSec=30
+SuccessExitStatus=0 143
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
+EOF
+
+  if ! systemctl --user daemon-reload >/dev/null 2>&1; then
+    log_warn "systemctl --user daemon-reload 失败（可能是 user bus 未就绪）。"
+    return 1
+  fi
+
+  if ! systemctl --user enable --now openclaw-gateway.service >/dev/null 2>&1; then
+    log_warn "systemctl --user enable --now openclaw-gateway.service 失败。"
+    return 1
+  fi
+
+  log_info "已通过手动 user unit 安装并启动 openclaw-gateway.service"
+  return 0
+}
+
+fallback_start_gateway_process() {
+  local gateway_log
+
+  if ! command -v openclaw >/dev/null 2>&1; then
+    return 1
+  fi
+
+  # 尝试补齐 local 模式，避免 gateway 拒绝启动。
+  openclaw config set gateway.mode local >/dev/null 2>&1 || true
+
+  gateway_log="/tmp/openclaw-gateway.log"
+  nohup openclaw gateway --port 18789 --bind loopback >"${gateway_log}" 2>&1 &
+  sleep 2
+
+  if openclaw gateway status --require-rpc >/dev/null 2>&1; then
+    log_warn "Gateway 已以后台进程方式启动（非 systemd）。日志: ${gateway_log}"
+    return 0
+  fi
+
+  log_warn "后台启动 Gateway 失败，请检查 ${gateway_log}"
+  return 1
+}
+
+recover_gateway_install_failure() {
+  log_warn "检测到 OpenClaw Gateway 服务安装已知问题，开始自动修复..."
+
+  if ! command -v openclaw >/dev/null 2>&1; then
+    log_error "OpenClaw 命令不存在，无法继续修复。"
+    return 1
+  fi
+
+  if openclaw gateway install --force >/tmp/openclaw-gateway-fix.log 2>&1; then
+    log_info "openclaw gateway install --force 修复成功"
+    return 0
+  fi
+  log_warn "官方命令修复失败，继续尝试手动安装 systemd user unit。"
+
+  if manual_install_gateway_service; then
+    return 0
+  fi
+
+  log_warn "systemd 修复失败，尝试兜底为后台进程运行。"
+  if fallback_start_gateway_process; then
+    return 0
+  fi
+
+  log_error "Gateway 自动修复失败。请执行: openclaw doctor && openclaw gateway status --deep"
+  return 1
+}
 
 run_remote_script() {
   local script_name="$1"
@@ -72,32 +206,76 @@ run_remote_script() {
   log_info "执行: ${url}"
   log_info "========================================"
 
-  # 先下载到临时文件再执行，避免 bash <(curl ...) 导致子进程不在同一进程组
-  # 这样 Ctrl+C 的 SIGINT 信号能正确传播到子脚本
-  CURRENT_TMP_SCRIPT=$(mktemp /tmp/openclaw-install-XXXXXX.sh)
-  local tmp_script="$CURRENT_TMP_SCRIPT"
-  if ! curl -fSL --connect-timeout 10 --max-time 120 -o "$tmp_script" "$url"; then
+  CURRENT_TMP_SCRIPT="$(mktemp /tmp/openclaw-install-XXXXXX.sh)"
+  CURRENT_TMP_LOG="$(mktemp /tmp/openclaw-install-XXXXXX.log)"
+
+  if ! curl -fSL --connect-timeout 10 --max-time 180 -o "${CURRENT_TMP_SCRIPT}" "${url}"; then
     log_error "下载失败: ${script_name}"
-    rm -f "$tmp_script"
+    cleanup_tmp
     return 1
   fi
 
-  chmod +x "$tmp_script"
-  if ! bash "$tmp_script"; then
+  chmod +x "${CURRENT_TMP_SCRIPT}"
+
+  set +e
+  bash "${CURRENT_TMP_SCRIPT}" 2>&1 | tee "${CURRENT_TMP_LOG}"
+  local run_code=${PIPESTATUS[0]}
+  set -e
+
+  if [ "${run_code}" -ne 0 ]; then
+    if [ "${script_name}" = "02-install-openclaw.sh" ] && is_gateway_service_known_issue "${CURRENT_TMP_LOG}"; then
+      if recover_gateway_install_failure; then
+        log_warn "已跳过 02 步骤中的 Gateway service 异常，继续后续安装。"
+        cleanup_tmp
+        log_info "完成(修复后继续): ${description}"
+        echo ""
+        return 0
+      fi
+    fi
+
     log_error "执行失败: ${script_name}"
-    rm -f "$tmp_script"
+    cleanup_tmp
     return 1
   fi
 
-  rm -f "$tmp_script"
+  cleanup_tmp
   log_info "完成: ${description}"
   echo ""
+}
+
+verify_install() {
+  log_info "开始验证安装结果..."
+
+  set +e
+  source /etc/profile >/dev/null 2>&1
+  set +e
+
+  if [ -s "${NVM_DIR:-/usr/local/nvm}/nvm.sh" ]; then
+    source "${NVM_DIR:-/usr/local/nvm}/nvm.sh"
+  fi
+
+  if ! command -v openclaw >/dev/null 2>&1; then
+    log_error "验证失败: openclaw 命令不可用"
+    return 1
+  fi
+
+  openclaw --version || return 1
+
+  if ! openclaw doctor --non-interactive; then
+    log_warn "doctor 返回非零，请稍后手动检查。"
+  fi
+
+  if ! openclaw gateway status --require-rpc; then
+    log_warn "Gateway 暂未通过 RPC 探测，可稍后执行: openclaw gateway status --deep"
+  fi
+
+  return 0
 }
 
 main() {
   log_info "========== OpenClaw 一键安装 =========="
   log_info "开始时间: $(date)"
-  log_info "提示: 安装过程中每 15 秒会输出心跳信息，表示安装仍在进行中"
+  log_info "提示: 安装过程中每 ${HEARTBEAT_SECONDS} 秒输出一次心跳信息"
   echo ""
 
   start_heartbeat
@@ -109,7 +287,7 @@ main() {
     local script_name="${step%%|*}"
     local description="${step##*|}"
 
-    if ! run_remote_script "$script_name" "$description"; then
+    if ! run_remote_script "${script_name}" "${description}"; then
       log_error "${description} 失败，中止安装"
       failed=1
       break
@@ -117,44 +295,16 @@ main() {
   done
 
   echo ""
-  if [ $failed -eq 0 ]; then
-    log_info "========== 安装完成 =========="
-    log_info "正在加载环境变量..."
-
-    # 关闭 set -e，防止环境加载或验证阶段的非零退出码导致脚本中断
-    # 确保无论如何都能走到最后的 exec bash -l
-    set +e
-
-    if ! source /etc/profile; then
-      log_info "加载 /etc/profile 时出现异常，部分环境变量可能未正确设置"
-    fi
-    # /etc/profile 可能内部设置了 set -e，确保此处恢复为 +e
-    set +e
-
-    # 显式加载 NVM 环境，确保 node/pnpm/openclaw/clawhub 等命令可用
-    export NVM_DIR="${NVM_DIR:-/usr/local/nvm}"
-    if [ -s "$NVM_DIR/nvm.sh" ]; then
-      source "$NVM_DIR/nvm.sh"
-    fi
-
-    log_info "环境变量已加载"
-    log_info "验证安装结果:"
-
-    # 验证命令是否可用，失败只输出警告，不阻止进入新 shell
-    if openclaw --version && clawhub -V && openclaw plugins list; then
-      log_info "所有命令验证通过"
+  if [ "${failed}" -eq 0 ]; then
+    if verify_install; then
+      log_info "========== 安装完成 =========="
+      log_info "环境已就绪，建议执行: openclaw gateway status --deep"
     else
-      log_info "警告: 部分命令验证失败，请在新终端中手动检查"
+      log_error "安装完成，但验证阶段发现问题，请检查日志。"
+      exit 1
     fi
 
-    echo ""
-    log_info "=========================================="
-    log_info "安装完成! 正在启动新的终端会话以加载环境变量..."
-    log_info "=========================================="
-    # exec 会替换当前进程，不会触发 EXIT trap，需要手动停止心跳
     stop_heartbeat
-    # 启动一个新的登录 shell，自动加载 /etc/profile 中的环境变量
-    # 这样用户无需手动 source /etc/profile，node/nvm/pnpm 等命令立即可用
     exec bash -l
   else
     log_error "========== 安装失败 =========="
