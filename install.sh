@@ -16,6 +16,7 @@ HEARTBEAT_PID=""
 CURRENT_TMP_SCRIPT=""
 CURRENT_TMP_LOG=""
 NPM_USERCONFIG_TMP=""
+OPENCLAW_BIN=""
 
 REGISTRY_CANDIDATES=(
   "${OPENCLAW_PRIMARY_REGISTRY:-https://registry.npmmirror.com/}"
@@ -93,6 +94,92 @@ normalize_registry() {
   echo "${registry}"
 }
 
+bootstrap_node_env() {
+  # Try common profile files first.
+  [ -f /etc/profile ] && source /etc/profile >/dev/null 2>&1 || true
+  [ -f /etc/bash.bashrc ] && source /etc/bash.bashrc >/dev/null 2>&1 || true
+  [ -f "${HOME}/.profile" ] && source "${HOME}/.profile" >/dev/null 2>&1 || true
+  [ -f "${HOME}/.bashrc" ] && source "${HOME}/.bashrc" >/dev/null 2>&1 || true
+
+  # NVM initialization (common locations).
+  if [ -s "${NVM_DIR:-/usr/local/nvm}/nvm.sh" ]; then
+    source "${NVM_DIR:-/usr/local/nvm}/nvm.sh" >/dev/null 2>&1 || true
+  fi
+  if [ -s "${HOME}/.nvm/nvm.sh" ]; then
+    source "${HOME}/.nvm/nvm.sh" >/dev/null 2>&1 || true
+  fi
+
+  # Ensure global npm bin is in PATH.
+  if command -v npm >/dev/null 2>&1; then
+    local npm_prefix
+    npm_prefix="$(npm prefix -g 2>/dev/null || true)"
+    if [ -n "${npm_prefix}" ] && [ -d "${npm_prefix}/bin" ]; then
+      case ":$PATH:" in
+        *":${npm_prefix}/bin:"*) ;;
+        *) export PATH="${npm_prefix}/bin:${PATH}" ;;
+      esac
+    fi
+  fi
+
+  # Common fallback paths.
+  case ":$PATH:" in
+    *":${HOME}/.npm-global/bin:"*) ;;
+    *) [ -d "${HOME}/.npm-global/bin" ] && export PATH="${HOME}/.npm-global/bin:${PATH}" ;;
+  esac
+  case ":$PATH:" in
+    *":${HOME}/.local/bin:"*) ;;
+    *) [ -d "${HOME}/.local/bin" ] && export PATH="${HOME}/.local/bin:${PATH}" ;;
+  esac
+  case ":$PATH:" in
+    *":${HOME}/.openclaw/bin:"*) ;;
+    *) [ -d "${HOME}/.openclaw/bin" ] && export PATH="${HOME}/.openclaw/bin:${PATH}" ;;
+  esac
+
+  hash -r 2>/dev/null || true
+}
+
+ensure_openclaw_command() {
+  if [ -n "${OPENCLAW_BIN}" ] && [ -x "${OPENCLAW_BIN}" ]; then
+    return 0
+  fi
+
+  bootstrap_node_env
+
+  if command -v openclaw >/dev/null 2>&1; then
+    OPENCLAW_BIN="$(command -v openclaw)"
+    return 0
+  fi
+
+  local candidate
+  for candidate in \
+    "${HOME}/.npm-global/bin/openclaw" \
+    "${HOME}/.local/bin/openclaw" \
+    "${HOME}/.openclaw/bin/openclaw" \
+    "/usr/local/bin/openclaw" \
+    "/usr/bin/openclaw"
+  do
+    if [ -x "${candidate}" ]; then
+      OPENCLAW_BIN="${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+openclaw_exec() {
+  ensure_openclaw_command || return 127
+  "${OPENCLAW_BIN}" "$@"
+}
+
+debug_openclaw_env() {
+  log_warn "Diagnostics: PATH=${PATH}"
+  log_warn "Diagnostics: node=$(command -v node || echo missing), npm=$(command -v npm || echo missing), openclaw=$(command -v openclaw || echo missing)"
+  if command -v npm >/dev/null 2>&1; then
+    log_warn "Diagnostics: npm prefix -g=$(npm prefix -g 2>/dev/null || echo unknown)"
+  fi
+}
+
 apply_registry_override() {
   local registry
   registry="$(normalize_registry "$1")"
@@ -158,6 +245,43 @@ run_step_script() {
   return "${run_code}"
 }
 
+bootstrap_openclaw_cli() {
+  local registry
+  local npm_prefix="${HOME}/.npm-global"
+
+  if ensure_openclaw_command; then
+    return 0
+  fi
+
+  bootstrap_node_env
+  if ! command -v npm >/dev/null 2>&1; then
+    log_warn "npm command not found; cannot auto-install openclaw CLI."
+    return 1
+  fi
+
+  mkdir -p "${npm_prefix}/bin" >/dev/null 2>&1 || true
+  export NPM_CONFIG_PREFIX="${npm_prefix}"
+  export npm_config_prefix="${npm_prefix}"
+  case ":$PATH:" in
+    *":${npm_prefix}/bin:"*) ;;
+    *) export PATH="${npm_prefix}/bin:${PATH}" ;;
+  esac
+
+  for registry in "${REGISTRY_CANDIDATES[@]}"; do
+    apply_registry_override "${registry}"
+    log_warn "openclaw CLI missing; trying npm install with registry: $(normalize_registry "${registry}")"
+    if npm install -g openclaw@latest >/tmp/openclaw-cli-bootstrap.log 2>&1; then
+      if ensure_openclaw_command; then
+        log_info "openclaw CLI bootstrap succeeded: ${OPENCLAW_BIN}"
+        return 0
+      fi
+    fi
+  done
+
+  log_error "Failed to bootstrap openclaw CLI. Log: /tmp/openclaw-cli-bootstrap.log"
+  return 1
+}
+
 retry_openclaw_install_with_registries() {
   local script_path="$1"
   local registry
@@ -213,7 +337,7 @@ prepare_user_systemd_context() {
 manual_install_gateway_service() {
   local svc_dir svc_file openclaw_bin
 
-  if ! command -v openclaw >/dev/null 2>&1; then
+  if ! ensure_openclaw_command; then
     log_warn "openclaw command not found; cannot recover gateway service."
     return 1
   fi
@@ -224,11 +348,11 @@ manual_install_gateway_service() {
   fi
 
   prepare_user_systemd_context
-  openclaw config set gateway.mode local >/dev/null 2>&1 || true
+  openclaw_exec config set gateway.mode local >/dev/null 2>&1 || true
 
   svc_dir="${HOME}/.config/systemd/user"
   svc_file="${svc_dir}/openclaw-gateway.service"
-  openclaw_bin="$(command -v openclaw)"
+  openclaw_bin="${OPENCLAW_BIN}"
 
   mkdir -p "${svc_dir}"
 
@@ -268,17 +392,17 @@ EOF
 fallback_start_gateway_process() {
   local gateway_log
 
-  if ! command -v openclaw >/dev/null 2>&1; then
+  if ! ensure_openclaw_command; then
     return 1
   fi
 
-  openclaw config set gateway.mode local >/dev/null 2>&1 || true
+  openclaw_exec config set gateway.mode local >/dev/null 2>&1 || true
 
   gateway_log="/tmp/openclaw-gateway.log"
-  nohup openclaw gateway --port 18789 --bind loopback >"${gateway_log}" 2>&1 &
+  nohup "${OPENCLAW_BIN}" gateway --port 18789 --bind loopback >"${gateway_log}" 2>&1 &
   sleep 2
 
-  if openclaw gateway status --require-rpc >/dev/null 2>&1; then
+  if openclaw_exec gateway status --require-rpc >/dev/null 2>&1; then
     log_warn "Gateway started as background process (not systemd). Log: ${gateway_log}"
     return 0
   fi
@@ -290,12 +414,17 @@ fallback_start_gateway_process() {
 recover_gateway_install_failure() {
   log_warn "Detected known Gateway service install issue. Starting recovery..."
 
-  if ! command -v openclaw >/dev/null 2>&1; then
-    log_error "openclaw command missing; cannot recover."
-    return 1
+  if ! ensure_openclaw_command; then
+    debug_openclaw_env
+    log_warn "openclaw command missing in current shell; trying CLI bootstrap..."
+    if ! bootstrap_openclaw_cli; then
+      debug_openclaw_env
+      log_error "openclaw command missing; cannot recover."
+      return 1
+    fi
   fi
 
-  if openclaw gateway install --force >/tmp/openclaw-gateway-fix.log 2>&1; then
+  if openclaw_exec gateway install --force >/tmp/openclaw-gateway-fix.log 2>&1; then
     log_info "Gateway recovery via 'openclaw gateway install --force' succeeded."
     return 0
   fi
@@ -382,26 +511,20 @@ run_remote_script() {
 verify_install() {
   log_info "Verifying installation..."
 
-  set +e
-  source /etc/profile >/dev/null 2>&1
-  set +e
+  bootstrap_node_env
 
-  if [ -s "${NVM_DIR:-/usr/local/nvm}/nvm.sh" ]; then
-    source "${NVM_DIR:-/usr/local/nvm}/nvm.sh"
-  fi
-
-  if ! command -v openclaw >/dev/null 2>&1; then
+  if ! ensure_openclaw_command; then
     log_error "Verification failed: openclaw command unavailable"
     return 1
   fi
 
-  openclaw --version || return 1
+  openclaw_exec --version || return 1
 
-  if ! openclaw doctor --non-interactive; then
+  if ! openclaw_exec doctor --non-interactive; then
     log_warn "'openclaw doctor' returned non-zero; please inspect manually."
   fi
 
-  if ! openclaw gateway status --require-rpc; then
+  if ! openclaw_exec gateway status --require-rpc; then
     log_warn "Gateway RPC check failed; run: openclaw gateway status --deep"
   fi
 
