@@ -335,7 +335,7 @@ prepare_user_systemd_context() {
 }
 
 manual_install_gateway_service() {
-  local svc_dir svc_file openclaw_bin
+  local openclaw_bin
 
   if ! ensure_openclaw_command; then
     log_warn "openclaw command not found; cannot recover gateway service."
@@ -347,12 +347,49 @@ manual_install_gateway_service() {
     return 1
   fi
 
-  prepare_user_systemd_context
   openclaw_exec config set gateway.mode local >/dev/null 2>&1 || true
-
-  svc_dir="${HOME}/.config/systemd/user"
-  svc_file="${svc_dir}/openclaw-gateway.service"
   openclaw_bin="${OPENCLAW_BIN}"
+
+  # Root install: prefer system service to avoid user-bus issues.
+  if [ "$(id -u)" -eq 0 ]; then
+    local svc_file="/etc/systemd/system/openclaw-gateway.service"
+    cat > "${svc_file}" <<EOF
+[Unit]
+Description=OpenClaw Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=${openclaw_bin} gateway --port 18789 --bind loopback
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+TimeoutStartSec=30
+SuccessExitStatus=0 143
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    if ! systemctl daemon-reload >/dev/null 2>&1; then
+      log_warn "systemctl daemon-reload failed."
+      return 1
+    fi
+
+    if ! systemctl enable --now openclaw-gateway.service >/dev/null 2>&1; then
+      log_warn "systemctl enable --now openclaw-gateway.service failed."
+      return 1
+    fi
+
+    log_info "Gateway service installed and started via system systemd unit."
+    return 0
+  fi
+
+  # Non-root install: user service.
+  prepare_user_systemd_context
+  local svc_dir="${HOME}/.config/systemd/user"
+  local svc_file="${svc_dir}/openclaw-gateway.service"
 
   mkdir -p "${svc_dir}"
 
